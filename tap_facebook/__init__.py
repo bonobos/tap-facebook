@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import json
 import os
 import os.path
@@ -16,6 +17,7 @@ import backoff
 
 import singer
 import singer.metrics as metrics
+from requests import Session
 from singer import utils, metadata
 from singer import (transform,
                     UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING,
@@ -37,6 +39,7 @@ from facebook_business.exceptions import FacebookRequestError
 TODAY = pendulum.today()
 
 API = None
+auth = None
 
 INSIGHTS_MAX_WAIT_TO_START_SECONDS = 2 * 60
 INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS = 30 * 60
@@ -77,11 +80,14 @@ LOGGER = singer.get_logger()
 
 CONFIG = {}
 
+
 class TapFacebookException(Exception):
     pass
 
+
 class InsightsJobTimeout(TapFacebookException):
     pass
+
 
 def transform_datetime_string(dts):
     parsed_dt = dateutil.parser.parse(dts)
@@ -90,6 +96,7 @@ def transform_datetime_string(dts):
     else:
         parsed_dt = parsed_dt.astimezone(timezone.utc)
     return singer.strftime(parsed_dt)
+
 
 def iter_delivery_info_filter(stream_type):
     filt = {
@@ -106,15 +113,17 @@ def iter_delivery_info_filter(stream_type):
 
     sub_list_length = 3
     for i in range(0, len(filt_values), sub_list_length):
-        filt['value'] = filt_values[i:i+sub_list_length]
+        filt['value'] = filt_values[i:i + sub_list_length]
         yield filt
+
 
 def retry_pattern(backoff_type, exception, **wait_gen_kwargs):
     # HACK: Workaround added due to bug with Facebook prematurely deprecating 'relevance_score'
     # Issue being tracked here: https://developers.facebook.com/support/bugs/2489592517771422
     def is_relevance_score(exception):
         if getattr(exception, "body", None):
-            return exception.body().get("error", {}).get("message") == '(#100) relevance_score is not valid for fields param. please check https://developers.facebook.com/docs/marketing-api/reference/ads-insights/ for all valid values'
+            return exception.body().get("error", {}).get(
+                "message") == '(#100) relevance_score is not valid for fields param. please check https://developers.facebook.com/docs/marketing-api/reference/ads-insights/ for all valid values'
         else:
             return False
 
@@ -133,7 +142,8 @@ def retry_pattern(backoff_type, exception, **wait_gen_kwargs):
 
     def should_retry_api_error(exception):
         if isinstance(exception, FacebookRequestError):
-            return exception.api_transient_error() or exception.api_error_subcode() == 99 or is_relevance_score(exception)
+            return exception.api_transient_error() or exception.api_error_subcode() == 99 or is_relevance_score(
+                exception)
         elif isinstance(exception, InsightsJobTimeout):
             return True
         return False
@@ -146,6 +156,7 @@ def retry_pattern(backoff_type, exception, **wait_gen_kwargs):
         giveup=lambda exc: not should_retry_api_error(exc),
         **wait_gen_kwargs
     )
+
 
 @attr.s
 class Stream(object):
@@ -160,12 +171,11 @@ class Stream(object):
             props = metadata.to_map(self.catalog_entry.metadata)
             for breadcrumb, data in props.items():
                 if len(breadcrumb) != 2:
-                    continue # Skip root and nested metadata
+                    continue  # Skip root and nested metadata
 
                 if data.get('inclusion') == 'automatic':
                     fields.add(breadcrumb[1])
         return fields
-
 
     def fields(self):
         fields = set()
@@ -173,15 +183,15 @@ class Stream(object):
             props = metadata.to_map(self.catalog_entry.metadata)
             for breadcrumb, data in props.items():
                 if len(breadcrumb) != 2:
-                    continue # Skip root and nested metadata
+                    continue  # Skip root and nested metadata
 
                 if data.get('selected') or data.get('inclusion') == 'automatic':
                     fields.add(breadcrumb[1])
         return fields
 
+
 @attr.s
 class IncrementalStream(Stream):
-
     state = attr.ib()
 
     def __attrs_post_init__(self):
@@ -223,6 +233,10 @@ def ad_creative_failure(response):
 
 
 # AdCreative is not an interable stream as it uses the batch endpoint
+class Requests(object):
+    pass
+
+
 class AdCreative(Stream):
     '''
     doc: https://developers.facebook.com/docs/marketing-api/reference/adgroup/adcreatives/
@@ -231,34 +245,70 @@ class AdCreative(Stream):
     field_class = adcreative.AdCreative.Field
     key_properties = ['id']
 
-
     def sync(self):
+        url = ''.join(('https://graph.facebook.com/v6.0/act_',
+                       auth[0],
+                       '?fields=ads.limit(5000)%7Badcreatives%7B',
+                       'url_tags%7D%7D&access_token=',
+                       auth[1]))
+        session = Session()
+
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
+        @utils.ratelimit(1, 1500)
         def do_request():
-            return self.account.get_ad_creatives(params={'limit': RESULT_RETURN_LIMIT})
+            return session.request('get', url)
 
-        ad_creative = do_request()
+        def ad_creatives_get(retry=0):
+            retry_count = 0
+            resp = do_request()
+            # parse json structure and continue to get next set of data until end
+            if 'ads' in resp.json() and 'data' in resp.json().get('ads'):
+                ads = resp.json().get('ads')
+                transformed = []
+                for adcreatives in ads.get('data'):
+                    transformed.extend(adcreatives.get('adcreatives').get('data'))
+                next_page = ads.get('paging').get('next')
+                while next_page:
+                    resp = session.request('get', next_page)
+                    # bad responses - re-execute same next_page call again
+                    if resp.status_code == 200 and resp:
+                        next_page = resp.json().get('paging').get('next')
+                        data = resp.json().get('data')
+                        transformed = []
+                        for adcreatives in data:
+                            transformed.extend(adcreatives.get('adcreatives').get('data'))
+                        retry_count = 0
+                    elif retry_count <= 2:
+                        LOGGER.info('Retrying creative paging request after sleeping. \
+                                Status: {status_code} Retry Count: {retry_count}'
+                                    .format(status_code=resp.status_code, retry_count=retry_count))
+                        time.sleep(5)
+                        retry_count += 1
+                        continue
+                    else:
+                        raise Exception('Facebook creative API paging didnt \
+                                load after 3 attempts!')
+                return transformed
+            elif retry < 3:
+                LOGGER.info('Retrying creative paging request after sleeping. \
+                                Status: {status_code} Retry Count: {retry_count}'
+                            .format(status_code=resp.status_code, retry_count=retry_count))
+                time.sleep(5)
+                retry += 1
+                ad_creatives_get(retry)
+            else:
+                if not resp:
+                    raise Exception(resp.content)
+                raise Exception('Facebook creative API json ads was empty  \
+                        after 3 attempts!')
 
-        # Create the initial batch
-        api_batch = API.new_batch()
-        batch_count = 0
+        response = ad_creatives_get()
+        refs = load_shared_schema_refs()
+        schema = singer.resolve_schema_references(self.catalog_entry.schema.to_dict(), refs)
 
-        # This loop syncs minimal AdCreative objects
-        for a in ad_creative:
-            # Excecute and create a new batch for every 50 added
-            if batch_count % 50 == 0:
-                api_batch.execute()
-                api_batch = API.new_batch()
-
-            # Add a call to the batch with the full object
-            a.api_get(fields=self.fields(),
-                      batch=api_batch,
-                      success=partial(ad_creative_success, stream=self),
-                      failure=ad_creative_failure)
-            batch_count += 1
-
-        # Ensure the final batch is executed
-        api_batch.execute()
+        for rec in response:
+            record = Transformer(pre_hook=transform_date_hook).transform(rec, schema)
+            singer.write_record(self.name, record, self.stream_alias, utils.now())
 
 
 class Ads(IncrementalStream):
@@ -274,18 +324,21 @@ class Ads(IncrementalStream):
         def do_request():
             params = {'limit': RESULT_RETURN_LIMIT}
             if self.current_bookmark:
-                params.update({'filtering': [{'field': 'ad.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN', 'value': self.current_bookmark.int_timestamp}]})
-            yield self.account.get_ads(fields=self.automatic_fields(), params=params) # pylint: disable=no-member
+                params.update({'filtering': [{'field': 'ad.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN',
+                                              'value': self.current_bookmark.int_timestamp}]})
+            yield self.account.get_ads(fields=self.automatic_fields(), params=params)  # pylint: disable=no-member
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
         def do_request_multiple():
             params = {'limit': RESULT_RETURN_LIMIT}
             bookmark_params = []
             if self.current_bookmark:
-                bookmark_params.append({'field': 'ad.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN', 'value': self.current_bookmark.int_timestamp})
+                bookmark_params.append({'field': 'ad.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN',
+                                        'value': self.current_bookmark.int_timestamp})
             for del_info_filt in iter_delivery_info_filter('ad'):
                 params.update({'filtering': [del_info_filt] + bookmark_params})
-                filt_ads = self.account.get_ads(fields=self.automatic_fields(), params=params) # pylint: disable=no-member
+                filt_ads = self.account.get_ads(fields=self.automatic_fields(),
+                                                params=params)  # pylint: disable=no-member
                 yield filt_ads
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
@@ -313,18 +366,21 @@ class AdSets(IncrementalStream):
         def do_request():
             params = {'limit': RESULT_RETURN_LIMIT}
             if self.current_bookmark:
-                params.update({'filtering': [{'field': 'adset.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN', 'value': self.current_bookmark.int_timestamp}]})
-            yield self.account.get_ad_sets(fields=self.automatic_fields(), params=params) # pylint: disable=no-member
+                params.update({'filtering': [{'field': 'adset.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN',
+                                              'value': self.current_bookmark.int_timestamp}]})
+            yield self.account.get_ad_sets(fields=self.automatic_fields(), params=params)  # pylint: disable=no-member
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
         def do_request_multiple():
             params = {'limit': RESULT_RETURN_LIMIT}
             bookmark_params = []
             if self.current_bookmark:
-                bookmark_params.append({'field': 'adset.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN', 'value': self.current_bookmark.int_timestamp})
+                bookmark_params.append({'field': 'adset.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN',
+                                        'value': self.current_bookmark.int_timestamp})
             for del_info_filt in iter_delivery_info_filter('adset'):
                 params.update({'filtering': [del_info_filt] + bookmark_params})
-                filt_adsets = self.account.get_ad_sets(fields=self.automatic_fields(), params=params) # pylint: disable=no-member
+                filt_adsets = self.account.get_ad_sets(fields=self.automatic_fields(),
+                                                       params=params)  # pylint: disable=no-member
                 yield filt_adsets
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
@@ -339,8 +395,8 @@ class AdSets(IncrementalStream):
         for message in self._iterate(ad_sets, prepare_record):
             yield message
 
-class Campaigns(IncrementalStream):
 
+class Campaigns(IncrementalStream):
     field_class = fb_campaign.Campaign.Field
     key_properties = ['id']
 
@@ -353,18 +409,21 @@ class Campaigns(IncrementalStream):
         def do_request():
             params = {'limit': RESULT_RETURN_LIMIT}
             if self.current_bookmark:
-                params.update({'filtering': [{'field': 'campaign.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN', 'value': self.current_bookmark.int_timestamp}]})
-            yield self.account.get_campaigns(fields=self.automatic_fields(), params=params) # pylint: disable=no-member
+                params.update({'filtering': [{'field': 'campaign.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN',
+                                              'value': self.current_bookmark.int_timestamp}]})
+            yield self.account.get_campaigns(fields=self.automatic_fields(), params=params)  # pylint: disable=no-member
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
         def do_request_multiple():
             params = {'limit': RESULT_RETURN_LIMIT}
             bookmark_params = []
             if self.current_bookmark:
-                bookmark_params.append({'field': 'campaign.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN', 'value': self.current_bookmark.int_timestamp})
+                bookmark_params.append({'field': 'campaign.' + UPDATED_TIME_KEY, 'operator': 'GREATER_THAN',
+                                        'value': self.current_bookmark.int_timestamp})
             for del_info_filt in iter_delivery_info_filter('campaign'):
                 params.update({'filtering': [del_info_filt] + bookmark_params})
-                filt_campaigns = self.account.get_campaigns(fields=self.automatic_fields(), params=params) # pylint: disable=no-member
+                filt_campaigns = self.account.get_campaigns(fields=self.automatic_fields(),
+                                                            params=params)  # pylint: disable=no-member
                 yield filt_campaigns
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
@@ -401,6 +460,7 @@ ALL_ACTION_BREAKDOWNS = [
     'action_destination'
 ]
 
+
 def get_start(stream, bookmark_key):
     tap_stream_id = stream.name
     state = stream.state or {}
@@ -414,6 +474,7 @@ def get_start(stream, bookmark_key):
     LOGGER.info("found current bookmark for %s:  %s", tap_stream_id, current_bookmark)
     return pendulum.parse(current_bookmark)
 
+
 def advance_bookmark(stream, bookmark_key, date):
     tap_stream_id = stream.name
     state = stream.state or {}
@@ -422,7 +483,7 @@ def advance_bookmark(stream, bookmark_key, date):
     current_bookmark = get_start(stream, bookmark_key)
 
     if date is None:
-        LOGGER.info('Did not get a date for stream %s '+
+        LOGGER.info('Did not get a date for stream %s ' +
                     ' not advancing bookmark',
                     tap_stream_id)
     elif not current_bookmark or date > current_bookmark:
@@ -435,6 +496,7 @@ def advance_bookmark(stream, bookmark_key, date):
                     'not changing to %s',
                     tap_stream_id, current_bookmark, date)
     return state
+
 
 @attr.s
 class AdsInsights(Stream):
@@ -493,7 +555,7 @@ class AdsInsights(Stream):
     @retry_pattern(backoff.expo, (FacebookRequestError, InsightsJobTimeout), max_tries=5, factor=5)
     def run_job(self, params):
         LOGGER.info('Starting adsinsights job with params %s', params)
-        job = self.account.get_insights( # pylint: disable=no-member
+        job = self.account.get_insights(  # pylint: disable=no-member
             params=params,
             is_async=True)
         status = None
@@ -523,7 +585,7 @@ class AdsInsights(Stream):
                                         'You should deselect fields from the schema that are not necessary, ' +
                                         'as that may help improve the reliability of the Facebook API.')
                 raise InsightsJobTimeout(pretty_error_message.format(job_id,
-                                                                     INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS//60))
+                                                                     INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS // 60))
 
             LOGGER.info("sleeping for %d seconds until job is done", sleep_time)
             time.sleep(sleep_time)
@@ -553,7 +615,7 @@ class AdsInsights(Stream):
                     if time_range['until']:
                         min_date_start_for_job = time_range['until']
             yield {'state': advance_bookmark(self, self.bookmark_key,
-                                             min_date_start_for_job)} # pylint: disable=no-member
+                                             min_date_start_for_job)}  # pylint: disable=no-member
 
 
 INSIGHTS_BREAKDOWNS_OPTIONS = {
@@ -572,7 +634,7 @@ INSIGHTS_BREAKDOWNS_OPTIONS = {
 }
 
 
-def initialize_stream(account, catalog_entry, state): # pylint: disable=too-many-return-statements
+def initialize_stream(account, catalog_entry, state):  # pylint: disable=too-many-return-statements
 
     name = catalog_entry.stream
     stream_alias = catalog_entry.stream_alias
@@ -603,11 +665,13 @@ def get_streams_to_sync(account, catalog, state):
             streams.append(initialize_stream(account, catalog_entry, state))
     return streams
 
+
 def transform_date_hook(data, typ, schema):
     if typ == 'string' and schema.get('format') == 'date-time' and isinstance(data, str):
         transformed = transform_datetime_string(data)
         return transformed
     return data
+
 
 def do_sync(account, catalog, state):
     streams_to_sync = get_streams_to_sync(account, catalog, state)
@@ -655,11 +719,12 @@ def load_schema(stream):
     return schema
 
 
-def initialize_streams_for_discovery(): # pylint: disable=invalid-name
+def initialize_streams_for_discovery():  # pylint: disable=invalid-name
     return [initialize_stream(None, CatalogEntry(stream=name), None)
             for name in STREAMS]
 
-def discover_schemas():
+
+def discover_schemas(select_all):
     # Load Facebook's shared schemas
     refs = load_shared_schema_refs()
 
@@ -670,7 +735,7 @@ def discover_schemas():
         schema = singer.resolve_schema_references(load_schema(stream), refs)
 
         mdata = metadata.to_map(metadata.get_standard_metadata(schema,
-                                               key_properties=stream.key_properties))
+                                                               key_properties=stream.key_properties))
 
         bookmark_key = BOOKMARK_KEYS.get(stream.name)
         if bookmark_key == UPDATED_TIME_KEY:
@@ -680,7 +745,14 @@ def discover_schemas():
                                   'tap_stream_id': stream.name,
                                   'schema': schema,
                                   'metadata': metadata.to_list(mdata)})
+
+    if select_all:
+        for stream in result.get('streams', []):
+            for stream_metadata in stream.get('metadata'):
+                stream_metadata.update({'metadata': {'selected': True}})
+
     return result
+
 
 def load_shared_schema_refs():
     shared_schemas_path = get_abs_path('schemas/shared')
@@ -695,15 +767,73 @@ def load_shared_schema_refs():
 
     return shared_schema_refs
 
-def do_discover():
+
+def parse_args(required_config_keys):
+    """Parse standard command-line args.
+    -c,--config     Config file
+    -s,--state      State file
+    -d,--discover   Run in discover mode
+    -a,--select_all Select all streams and fields for discover mode
+    -p,--properties Properties file: DEPRECATED, please use --catalog instead
+    --catalog       Catalog file
+    Returns the parsed args object from argparse. For each argument that
+    point to JSON files (config, state, properties), we will automatically
+    load and parse the JSON file.
+    """
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--config', '-c', help='Config file', required=True)
+    parser.add_argument('--state', '-s', help='State file')
+    parser.add_argument('--catalog', help='Catalog file')
+    parser.add_argument('--discover', '-d', action='store_true', help='Do schema discovery')
+    parser.add_argument('--select_all', '-a', action='store_true',
+                        help='Select all streams and fields in discover mode')
+    parser.add_argument('-p', '--properties', help='Property selections: DEPRECATED, Please use --catalog instead')
+
+    args = parser.parse_args()
+    if args.config:
+        setattr(args, 'config_path', args.config)
+        args.config = load_json(args.config)
+    if args.state:
+        setattr(args, 'state_path', args.state)
+        args.state = load_json(args.state)
+    else:
+        args.state = {}
+    if args.catalog:
+        setattr(args, 'catalog_path', args.catalog)
+        args.catalog = Catalog.load(args.catalog)
+    elif args.properties:
+        args.properties = load_json(args.properties)
+    if args.select_all and not args.discover:
+        parser.error('Select all only available for discovery mode')
+
+    check_config(args.config, required_config_keys)
+    return args
+
+
+def check_config(config, required_keys):
+    missing_keys = [key for key in required_keys if key not in config]
+    if missing_keys:
+        raise Exception("Config is missing required keys: {}".format(missing_keys))
+
+
+def load_json(path):
+    with open(path) as file:
+        return json.load(file)
+
+
+def do_discover(select_all):
     LOGGER.info('Loading schemas')
-    json.dump(discover_schemas(), sys.stdout, indent=4)
+    json.dump(discover_schemas(select_all), sys.stdout, indent=4)
 
 
 def main_impl():
-    args = utils.parse_args(REQUIRED_CONFIG_KEYS)
+    args = parse_args(REQUIRED_CONFIG_KEYS)
     account_id = args.config['account_id']
     access_token = args.config['access_token']
+
+    global auth
+    auth = [account_id, access_token]
 
     CONFIG.update(args.config)
 
@@ -722,15 +852,15 @@ def main_impl():
         raise TapFacebookException("Couldn't find account with id {}".format(account_id))
 
     if args.discover:
-        do_discover()
+        do_discover(args.select_all)
     elif args.properties:
         catalog = Catalog.from_dict(args.properties)
         do_sync(account, catalog, args.state)
     else:
         LOGGER.info("No properties were selected")
 
-def main():
 
+def main():
     try:
         main_impl()
     except TapFacebookException as e:

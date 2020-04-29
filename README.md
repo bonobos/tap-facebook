@@ -67,6 +67,11 @@ You can provide JSON file that contains a date for the streams to force the appl
  "ads_insights":"2017-01-01T00:00:00Z"}
 ```
 
+### Select all streams and fields in Discover Mode:
+```bash
+tap-facebook --config tap_config.json --discover --select_all > catalog.json 
+```
+
 ### Run the Tap
 
 `tap-facebook -c config.json -p properties.json -s state.json`
