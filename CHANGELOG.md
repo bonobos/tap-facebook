@@ -1,5 +1,8 @@
 # Changelog
-
+## 1.9.1
+  * Add `select_all` for streams and fields
+  * Change AdCreatives sync to pull back minimal data.
+  
 ## 1.9.0
   * Bump API version from `v4` to `v6` [#88](https://github.com/singer-io/tap-facebook/pull/88)
 
