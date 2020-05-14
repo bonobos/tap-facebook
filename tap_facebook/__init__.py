@@ -856,6 +856,8 @@ def main_impl():
     elif args.properties:
         catalog = Catalog.from_dict(args.properties)
         do_sync(account, catalog, args.state)
+    elif args.catalog:
+        do_sync(account, args.catalog, args.state)
     else:
         LOGGER.info("No properties were selected")
 
