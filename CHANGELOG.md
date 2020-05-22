@@ -1,4 +1,8 @@
 # Changelog
+
+## 1.9.2
+  * Support catalog argument
+
 ## 1.9.1
   * Add `select_all` for streams and fields
   * Change AdCreatives sync to pull back minimal data.
